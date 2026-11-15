@@ -1,11 +1,6 @@
 import { and, asc, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 
-import type {
-  ConnectorCredentials,
-  ConnectorMetadata,
-  NewUserConnector,
-  UserConnectorItem,
-} from '../schemas';
+import type { ConnectorCredentials, NewUserConnector, UserConnectorItem } from '../schemas';
 import { agentEvalDatasets, ConnectorStatus, userConnectors, userConnectorTools } from '../schemas';
 import type { LobeChatDatabase, Transaction } from '../type';
 import { buildWorkspacePayload, buildWorkspaceWhere } from '../utils/workspace';
@@ -438,7 +433,7 @@ export class ConnectorModel {
   updateMetadataIfContains = async (
     id: string,
     match: Record<string, unknown>,
-    metadata: ConnectorMetadata,
+    metadata: NonNullable<DecryptedConnector['metadata']>,
   ): Promise<boolean> => {
     const updated = await this.db
       .update(userConnectors)
