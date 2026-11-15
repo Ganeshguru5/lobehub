@@ -1,4 +1,9 @@
-import { requiresSsrfSafeTransport, withMandatoryApprovalMark } from '@lobechat/const';
+import {
+  hasMandatoryApproval,
+  MANDATORY_APPROVAL_KEY,
+  requiresSsrfSafeTransport,
+  withMandatoryApprovalMark,
+} from '@lobechat/const';
 import { buildMcpToolMetadata, getMcpToolVisibility } from '@lobechat/const/mcpApp';
 
 import type { ConnectorModel, DecryptedConnector } from '@/database/models/connector';
@@ -195,7 +200,8 @@ export const syncConnectorToolsById = async (
      * By tool name, the `humanIntervention` a marketplace manifest gives a tool
      * the server lists, which an MCP listing cannot carry (an HTTP marketplace
      * install). It applies as a listed tool's does in
-     * {@link syncConnectorToolsFromList}.
+     * {@link syncConnectorToolsFromList}. Without it (a refresh), a synced tool
+     * keeps the mandatory approval it has.
      */
     humanInterventions?: ReadonlyMap<string, unknown>;
   } = {},
@@ -224,19 +230,34 @@ export const syncConnectorToolsById = async (
     throw err;
   }
 
+  // Only an install holds the marketplace's policy. Any other sync (the
+  // background refresh, a manual one, the OAuth callback) has the listing
+  // alone, which cannot tell whether a manifest's `always` still holds: the
+  // tools it marked mandatory stay so, or auto-run would skip their approval.
+  const keptMandatory = options.humanInterventions
+    ? new Set<string>()
+    : new Set(
+        (await ctx.connectorToolModel.queryByConnector(connectorId))
+          .filter((tool) => hasMandatoryApproval(tool.metadata))
+          .map((tool) => tool.toolName),
+      );
+
   const syncInputs = rawTools.map((t) => {
     const humanIntervention = options.humanInterventions?.get(t.name);
+    // Kept even for view-only tools: a view's call must find the tool synced,
+    // while the manifest build leaves it out of the model's tool list.
+    const metadata = withMandatoryApprovalMark(
+      buildMcpToolMetadata(getMcpToolVisibility(t._meta)),
+      humanIntervention,
+    );
     return {
       crudType: inferCrudType(t.name),
       defaultPermission: resolveConnectorToolPermission(humanIntervention),
       description: t.description,
       inputSchema: t.inputSchema as Record<string, unknown>,
-      // Kept even for view-only tools: a view's call must find the tool synced,
-      // while the manifest build leaves it out of the model's tool list.
-      metadata: withMandatoryApprovalMark(
-        buildMcpToolMetadata(getMcpToolVisibility(t._meta)),
-        humanIntervention,
-      ),
+      metadata: keptMandatory.has(t.name)
+        ? { ...metadata, [MANDATORY_APPROVAL_KEY]: true }
+        : metadata,
       toolName: t.name,
     };
   });
