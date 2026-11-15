@@ -1,10 +1,19 @@
 import { and, asc, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 
-import type { ConnectorCredentials, NewUserConnector, UserConnectorItem } from '../schemas';
+import type {
+  ConnectorCredentials,
+  ConnectorMetadata,
+  NewUserConnector,
+  UserConnectorItem,
+} from '../schemas';
 import { agentEvalDatasets, ConnectorStatus, userConnectors, userConnectorTools } from '../schemas';
 import type { LobeChatDatabase, Transaction } from '../type';
 import { buildWorkspacePayload, buildWorkspaceWhere } from '../utils/workspace';
-import { EvalConnectorUpdateError, normalizeEvalConnectorPatch } from './connectorEval';
+import {
+  EvalConnectorUpdateError,
+  normalizeEvalConnectorPatch,
+  withoutEvalConnectorMarker,
+} from './connectorEval';
 import { connectorAccessScope } from './connectorScope';
 
 interface GateKeeper {
@@ -417,6 +426,33 @@ export class ConnectorModel {
       )
       .returning({ id: userConnectors.id });
     return deleted.length > 0;
+  };
+
+  /**
+   * Replace the row's metadata only while it still contains `match`, as
+   * {@link deleteIfMetadataContains} deletes: a writer that tagged the row
+   * finishes it only if no one has re-added it since, whose writer owns it now.
+   * An evaluation connection is left alone (its provenance goes through
+   * {@link update}). Returns whether it did.
+   */
+  updateMetadataIfContains = async (
+    id: string,
+    match: Record<string, unknown>,
+    metadata: ConnectorMetadata,
+  ): Promise<boolean> => {
+    const updated = await this.db
+      .update(userConnectors)
+      .set({ metadata: withoutEvalConnectorMarker(metadata), updatedAt: new Date() })
+      .where(
+        and(
+          eq(userConnectors.id, id),
+          this.ownership(),
+          sql`${userConnectors.metadata} @> ${JSON.stringify(match)}::jsonb`,
+          sql`NOT COALESCE(jsonb_exists(${userConnectors.metadata}, 'agentEval'), false)`,
+        ),
+      )
+      .returning({ id: userConnectors.id });
+    return updated.length > 0;
   };
 
   query = async (
