@@ -7,7 +7,7 @@ import {
 import { buildMcpToolMetadata, getMcpToolVisibility } from '@lobechat/const/mcpApp';
 
 import type { ConnectorModel, DecryptedConnector } from '@/database/models/connector';
-import type { ConnectorToolModel } from '@/database/models/connectorTool';
+import type { ConnectorToolModel, SyncToolInput } from '@/database/models/connectorTool';
 import type { ConnectorCredentials } from '@/database/schemas';
 import {
   ConnectorMcpConnectionType,
@@ -142,24 +142,17 @@ export interface ConnectorListedTool {
   visibility?: string[];
 }
 
-/**
- * Store a tool list the caller already holds, without reaching the server,
- * and mark the connector `connected`. A tool synced before keeps the
- * permission it has.
- */
-export const syncConnectorToolsFromList = async (
-  connectorId: string,
-  tools: ConnectorListedTool[],
-  ctx: {
-    connectorModel: Pick<ConnectorModel, 'updateStatus'>;
-    connectorToolModel: Pick<
-      ConnectorToolModel,
-      'deleteToolsNotIn' | 'queryByConnector' | 'upsertMany'
-    >;
-  },
-  options: ConnectorToolSyncOptions = {},
-): Promise<{ toolCount: number }> => {
-  const syncInputs = tools.map((t) => ({
+type ConnectorToolWriteContext = {
+  connectorModel: Pick<ConnectorModel, 'updateStatus'>;
+  connectorToolModel: Pick<
+    ConnectorToolModel,
+    'deleteToolsNotIn' | 'queryByConnector' | 'upsertMany'
+  >;
+};
+
+/** The sync inputs of a tool list the caller already holds. */
+export const buildListedToolSyncInputs = (tools: ConnectorListedTool[]): SyncToolInput[] =>
+  tools.map((t) => ({
     crudType: inferCrudType(t.toolName),
     // Applies to new tools only: a synced tool keeps the permission it has
     defaultPermission: resolveConnectorToolPermission(t.humanIntervention),
@@ -171,6 +164,16 @@ export const syncConnectorToolsFromList = async (
     toolName: t.toolName,
   }));
 
+/**
+ * Store the connector's tool sync inputs and mark it `connected`. A tool
+ * synced before keeps the permission it has.
+ */
+export const writeConnectorToolSyncInputs = async (
+  connectorId: string,
+  syncInputs: SyncToolInput[],
+  ctx: ConnectorToolWriteContext,
+  options: ConnectorToolSyncOptions = {},
+): Promise<{ toolCount: number }> => {
   await ctx.connectorToolModel.upsertMany(connectorId, syncInputs);
   if (options.pruneMissingAutoTools) {
     await pruneMissingAutoConnectorTools(
@@ -184,28 +187,44 @@ export const syncConnectorToolsFromList = async (
 };
 
 /**
- * Connect to a connector's MCP server, fetch its tool list, and sync it into
- * `user_connector_tools`. Refreshes the OAuth token first when needed, and
- * updates the connector status (`connected` on success, `error` on failure).
- *
- * Shared by the `syncTools` tRPC mutation and the OAuth callback so a connector
- * has its tools immediately after authorization — no client round-trip needed.
+ * Store a tool list the caller already holds, without reaching the server,
+ * and mark the connector `connected`. A tool synced before keeps the
+ * permission it has.
  */
-export const syncConnectorToolsById = async (
+export const syncConnectorToolsFromList = async (
+  connectorId: string,
+  tools: ConnectorListedTool[],
+  ctx: ConnectorToolWriteContext,
+  options: ConnectorToolSyncOptions = {},
+): Promise<{ toolCount: number }> =>
+  writeConnectorToolSyncInputs(connectorId, buildListedToolSyncInputs(tools), ctx, options);
+
+export interface ConnectorToolListOptions {
+  /**
+   * By tool name, the `humanIntervention` a marketplace manifest gives a tool
+   * the server lists, which an MCP listing cannot carry (an HTTP marketplace
+   * install). It applies as a listed tool's does in
+   * {@link syncConnectorToolsFromList}. Without it (a refresh), a synced tool
+   * keeps the mandatory approval it has.
+   */
+  humanInterventions?: ReadonlyMap<string, unknown>;
+}
+
+/**
+ * Connect to a connector's MCP server and build the sync inputs of the tools
+ * it lists, refreshing the OAuth token first when needed. Writes no tool and
+ * no status: {@link syncConnectorToolsById} does, as does a caller that must
+ * write them only while the row is still its own (a marketplace install).
+ */
+export const listConnectorToolSyncInputs = async (
   connectorId: string,
   /** `userId` decides the `mcp_apps` flag: with it on, view-only tools are listed too. */
   ctx: ConnectorToolSyncContext & { userId?: string | null },
-  options: ConnectorToolSyncOptions & {
-    /**
-     * By tool name, the `humanIntervention` a marketplace manifest gives a tool
-     * the server lists, which an MCP listing cannot carry (an HTTP marketplace
-     * install). It applies as a listed tool's does in
-     * {@link syncConnectorToolsFromList}. Without it (a refresh), a synced tool
-     * keeps the mandatory approval it has.
-     */
-    humanInterventions?: ReadonlyMap<string, unknown>;
+  options: ConnectorToolListOptions & {
+    /** Called when the server cannot be reached or refuses the listing, before it rethrows. */
+    onListError?: () => Promise<void>;
   } = {},
-): Promise<{ toolCount: number }> => {
+): Promise<SyncToolInput[]> => {
   let connector = await ctx.connectorModel.findById(connectorId);
   if (!connector) throw new Error('Connector not found');
 
@@ -226,7 +245,7 @@ export const syncConnectorToolsById = async (
       mcpApps: await isMcpAppsEnabled(ctx.userId),
     });
   } catch (err) {
-    await ctx.connectorModel.updateStatus(connectorId, ConnectorStatus.error);
+    await options.onListError?.();
     throw err;
   }
 
@@ -242,7 +261,7 @@ export const syncConnectorToolsById = async (
           .map((tool) => tool.toolName),
       );
 
-  const syncInputs = rawTools.map((t) => {
+  return rawTools.map((t) => {
     const humanIntervention = options.humanInterventions?.get(t.name);
     // Kept even for view-only tools: a view's call must find the tool synced,
     // while the manifest build leaves it out of the model's tool list.
@@ -261,16 +280,26 @@ export const syncConnectorToolsById = async (
       toolName: t.name,
     };
   });
+};
 
-  await ctx.connectorToolModel.upsertMany(connectorId, syncInputs);
-  if (options.pruneMissingAutoTools) {
-    await pruneMissingAutoConnectorTools(
-      ctx.connectorToolModel,
-      connectorId,
-      syncInputs.map((tool) => tool.toolName),
-    );
-  }
-  await ctx.connectorModel.updateStatus(connectorId, ConnectorStatus.connected);
-
-  return { toolCount: syncInputs.length };
+/**
+ * Connect to a connector's MCP server, fetch its tool list, and sync it into
+ * `user_connector_tools`. Refreshes the OAuth token first when needed, and
+ * updates the connector status (`connected` on success, `error` on failure).
+ *
+ * Shared by the `syncTools` tRPC mutation and the OAuth callback so a connector
+ * has its tools immediately after authorization — no client round-trip needed.
+ */
+export const syncConnectorToolsById = async (
+  connectorId: string,
+  /** `userId` decides the `mcp_apps` flag: with it on, view-only tools are listed too. */
+  ctx: ConnectorToolSyncContext & { userId?: string | null },
+  options: ConnectorToolSyncOptions & ConnectorToolListOptions = {},
+): Promise<{ toolCount: number }> => {
+  const { pruneMissingAutoTools, ...listOptions } = options;
+  const syncInputs = await listConnectorToolSyncInputs(connectorId, ctx, {
+    ...listOptions,
+    onListError: () => ctx.connectorModel.updateStatus(connectorId, ConnectorStatus.error),
+  });
+  return writeConnectorToolSyncInputs(connectorId, syncInputs, ctx, { pruneMissingAutoTools });
 };
